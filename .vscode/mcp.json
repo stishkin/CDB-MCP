@@ -1,0 +1,9 @@
+{
+  "servers": {
+    "cdb-mcp": {
+      "type": "stdio",
+      "command": "${workspaceFolder}/run_mcp_server.bat",
+      "env": {}
+    }
+  }
+}
