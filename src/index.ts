@@ -48,6 +48,9 @@ let outputBuffer = "";
 
 const CDB_PROMPT_REGEX = /(\b\d+:\d+>\s*$|\bkd>\s*$|0: kd>\s*$|NoTarget>\s*$)/m;
 
+// Added variable to store the path of the last successfully started CDB
+let lastSuccessfullyStartedCdbPath: string | null = null;
+
 // Added function to ensure CDB process is stopped
 async function ensureCdbProcessStopped(): Promise<void> {
     if (cdbProcess && cdbProcess.pid && !cdbProcess.killed) {
@@ -62,6 +65,7 @@ async function ensureCdbProcessStopped(): Promise<void> {
                 currentCdbProcess?.removeAllListeners('error');
                 if (cdbProcess === currentCdbProcess) { // Only nullify if it's the same instance
                     cdbProcess = null;
+                    lastSuccessfullyStartedCdbPath = null; // Clear last successful path
                 }
                 logInfo('Existing CDB process has been stopped.');
                 resolve();
@@ -145,6 +149,7 @@ async function tryStartCdbInstance(debuggerPathToTry: string, spawnArgs: string[
                 if (promptResolverForThisAttempt) {
                     logInfo(`Prompt detected for '${debuggerPathToTry}'.`);
                     cleanupListeners();
+                    lastSuccessfullyStartedCdbPath = debuggerPathToTry; // Set last successful path
                     resolve(newProcess);
                     promptResolverForThisAttempt = null; 
                 }
@@ -205,6 +210,7 @@ function startCdbIfNeeded(callerDebuggerPath?: string, processArgs: string[] = [
                 const newProcess = await tryStartCdbInstance(currentPath, effectiveSpawnArgs);
                 successfullyStartedProcess = newProcess;
                 logInfo(`Successfully started and received initial prompt from '${currentPath}'.`);
+                lastSuccessfullyStartedCdbPath = currentPath; // Update the last successfully started CDB path
                 break; 
             } catch (error) {
                 logWarn(`Failed to start CDB with path '${currentPath}': ` + (error as Error).message);
@@ -259,6 +265,7 @@ function startCdbIfNeeded(callerDebuggerPath?: string, processArgs: string[] = [
                 commandInProgress = false;
                 currentCommandCompletion = null;
                 cdbProcess = null;
+                lastSuccessfullyStartedCdbPath = null; // Clear last successful path on exit
             });
             
             cdbProcess.on('error', (err) => {
@@ -272,7 +279,7 @@ function startCdbIfNeeded(callerDebuggerPath?: string, processArgs: string[] = [
     });
 }
 
-async function executeCdbCommandViaStdio(command: string, debuggerPath?: string, debuggerArgs: string[] = []): Promise<string> {
+async function executeCdbCommandViaStdio(command: string, debuggerPath?: string, debuggerArgs: string[] = [], isRetry: boolean = false): Promise<string> {
     logInfo(`[MCP Server] executeCdbCommandViaStdio called with command: ${command}`);
     if (commandInProgress) {
         logWarn("[MCP Server] executeCdbCommandViaStdio: Command already in progress.");
@@ -306,6 +313,60 @@ async function executeCdbCommandViaStdio(command: string, debuggerPath?: string,
                     reject(err);
                 }
             });
+
+            // Check for architecture mismatch after command execution
+            // This is a simplified check; more robust parsing might be needed
+            const originalResolve = currentCommandCompletion.resolve;
+            currentCommandCompletion.resolve = async (output: string) => {
+                if (output.includes("WOW64 mismatch") || output.includes("architecture mismatch")) {
+                    logWarn("Architecture mismatch detected. Attempting to switch CDB architecture.");
+                    await ensureCdbProcessStopped();
+                    
+                    // Determine the alternative architecture path
+                    // This is a simplified example; you might need a more robust way to find the other CDB
+                    let alternativeDebuggerPath: string | undefined = undefined;
+                    if (lastSuccessfullyStartedCdbPath) {
+                        if (lastSuccessfullyStartedCdbPath.toLowerCase().includes("x64")) {
+                            alternativeDebuggerPath = lastSuccessfullyStartedCdbPath.toLowerCase().replace("x64", "x86");
+                        } else if (lastSuccessfullyStartedCdbPath.toLowerCase().includes("x86")) {
+                            alternativeDebuggerPath = lastSuccessfullyStartedCdbPath.toLowerCase().replace("x86", "x64");
+                        } else {
+                            // If no x64/x86 in path, try appending/guessing - this is less reliable
+                            // For example, if cdb.exe is in PATH, this won't work well without more info
+                            logWarn("Could not determine alternative CDB path from last successful path: " + lastSuccessfullyStartedCdbPath);
+                            // As a fallback, try the other common default if the current one was the default
+                            const defaultX64 = "C:\\Program Files (x86)\\Windows Kits\\10\\Debuggers\\x64\\cdb.exe";
+                            const defaultX86 = "C:\\Program Files (x86)\\Windows Kits\\10\\Debuggers\\x86\\cdb.exe";
+                            if (lastSuccessfullyStartedCdbPath === defaultX64) alternativeDebuggerPath = defaultX86;
+                            else if (lastSuccessfullyStartedCdbPath === defaultX86) alternativeDebuggerPath = defaultX64;
+                        }
+                    }
+
+                    if (alternativeDebuggerPath && fs.existsSync(alternativeDebuggerPath)) {
+                        logInfo(`Retrying command '${command}' with CDB: ${alternativeDebuggerPath}`);
+                        try {
+                            // Retry the command with the alternative debugger path. 
+                            // Pass isRetry = true to prevent infinite loops if both architectures fail similarly.
+                            if (isRetry) {
+                                const retryFailMsg = `Architecture mismatch retry also failed for command '${command}'. Original output: ${output}`;
+                                logError(retryFailMsg);
+                                originalResolve(output + "\n\nARCHITECTURE MISMATCH RETRY FAILED: " + retryFailMsg); 
+                                return;
+                            }
+                            const retryOutput = await executeCdbCommandViaStdio(command, alternativeDebuggerPath, debuggerArgs, true);
+                            originalResolve(retryOutput);
+                        } catch (retryError) {
+                            logError(`Error retrying command with alternative CDB: ${(retryError as Error).message}`);
+                            originalResolve(output + `\n\nRETRY FAILED: ${(retryError as Error).message}`); // Resolve with original output + retry error
+                        }
+                    } else {
+                        logWarn("Could not find or determine alternative CDB architecture path. Original output will be returned.");
+                        originalResolve(output + "\n\nARCHITECTURE MISMATCH DETECTED, BUT COULD NOT RETRY WITH ALTERNATIVE ARCHITECTURE.");
+                    }
+                } else {
+                    originalResolve(output);
+                }
+            };
 
             setTimeout(() => {
                 if (commandInProgress && currentCommandCompletion) {
@@ -375,7 +436,7 @@ const createCdbMcpServer = () => {
     {
       processId: z.string().optional().describe("The ID of the process to attach to."),
       processName: z.string().optional().describe("The name of the process to attach to. (Use if PID is not known or for broader matching)"),
-      initialCommand: z.string().optional().describe("Optional command to execute immediately after attaching (e.g., !process, lm). Defaults to an echo message."),
+      initialCommand: z.string().optional().describe("Optional command to execute immediately after attaching (e.g., !process, lm, r). Defaults to an echo message."),
       debuggerPath: z.string().optional().describe("Optional path to the debugger executable (e.g., cdb.exe)."),
     },
     async ({ processId, processName, initialCommand, debuggerPath }: { processId?: string; processName?: string; initialCommand?: string; debuggerPath?: string; }) => {
@@ -442,6 +503,7 @@ const createCdbMcpServer = () => {
 
 async function main() {
     console.error("Starting CDB MCP Server (STDIO)..."); // Changed to console.error
+    logInfo("CDB MCP Server will attempt to use cdb.exe from the system PATH, and the default hardcoded path: C:\\\\Program Files (x86)\\\\Windows Kits\\\\10\\\\Debuggers\\\\x64\\\\cdb.exe. An x86 variant (C:\\\\Program Files (x86)\\\\Windows Kits\\\\10\\\\Debuggers\\\\x86\\\\cdb.exe) may also be tried, especially if an architecture mismatch is detected. A specific 'debuggerPath' provided to a tool will take precedence.");
     const server = createCdbMcpServer();
     const transport = new StdioServerTransport();
     server.connect(transport);
