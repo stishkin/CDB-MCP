@@ -3,6 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { spawn, ChildProcess } from "child_process";
+import * as fs from 'fs'; // Import fs module
 
 import { InitializeRequest, isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 
@@ -19,6 +20,25 @@ function logWarn(message: string) {
 
 function logError(message: string) {
     console.error(`[ERROR] ${message}`);
+}
+
+function formatCdbToolError(error: Error, operationDescription: string): string {
+    const lowerCaseMessage = error.message.toLowerCase();
+    let specificReason = "";
+
+    if (lowerCaseMessage.includes("enoent")) {
+        specificReason = "cdb.exe (or the specified debuggerPath) was not found (ENOENT).";
+    } else if (lowerCaseMessage.includes("failed to start cdb process with any of the attempted paths") || lowerCaseMessage.includes("all attempts failed")) {
+        specificReason = "Failed to start the CDB process with any of the attempted paths.";
+    } else if (lowerCaseMessage.includes("timeout waiting for initial prompt")) {
+        specificReason = "Timeout waiting for the initial prompt from CDB. The process might have started but became unresponsive or exited prematurely.";
+    }
+
+    if (specificReason) {
+        return `Error ${operationDescription}: ${specificReason} Please ensure CDB (cdb.exe) is installed correctly, accessible via your system's PATH, or that a valid 'debuggerPath' is provided if cdb.exe is in a non-standard location. CDB.exe is typically included with the Windows SDK or Windows Driver Kit (WDK), available from Microsoft. Original error: ${error.message}`;
+    }
+    // Default fallback message if no specific condition is met
+    return `Error ${operationDescription}: An unexpected error occurred. ${error.message}`;
 }
 
 let cdbProcess: ChildProcess | null = null;
@@ -88,6 +108,14 @@ let initialPromptResolver: ((output: string) => void) | null = null;
 
 async function tryStartCdbInstance(debuggerPathToTry: string, spawnArgs: string[]): Promise<ChildProcess> {
     return new Promise((resolve, reject) => {
+        // Check if the debugger executable exists
+        if (!fs.existsSync(debuggerPathToTry)) {
+            const errorMessage = `Debugger executable not found at path: ${debuggerPathToTry} (ENOENT).`;
+            logWarn(errorMessage);
+            reject(new Error(errorMessage));
+            return;
+        }
+
         logInfo(`Attempting to spawn: ${debuggerPathToTry} ${spawnArgs.join(' ')}`);
         const newProcess = spawn(debuggerPathToTry, spawnArgs, { stdio: ['pipe', 'pipe', 'pipe'] });
         let promptResolverForThisAttempt: ((output: string) => void) | null = null;
@@ -318,7 +346,7 @@ const createCdbMcpServer = () => {
       debuggerArgs: z.array(z.string()).optional().describe("Optional arguments to pass to the debugger when starting it (e.g., for attaching to a process: ['-p', '1234'] or ['-o', 'notepad.exe'])."),
     },
     async ({ command, debuggerPath, debuggerArgs }: { command: string; debuggerPath?: string, debuggerArgs?: string[] }) => {
-      logInfo(`[MCP Server] Tool 'execute-cdb-command' invoked with command: ${command}`);
+      logInfo(`[MCP Server] Tool \'execute-cdb-command\' invoked with command: ${command}`);
       try {
         const output = await executeCdbCommandViaStdio(command, debuggerPath, debuggerArgs);
         return {
@@ -327,12 +355,13 @@ const createCdbMcpServer = () => {
           ],
         };
       } catch (error: any) {
-        logError(`Error executing debugger command '${command}': ` + error.message);
+        logError(`Error executing debugger command \'${command}\': ` + error.message);
+        const userMessage = formatCdbToolError(error, `executing command \'${command}\'`);
         return {
           content: [
             {
               type: "text",
-              text: `Error executing command: ${error.message}`
+              text: userMessage
             },
           ],
         };
@@ -369,11 +398,13 @@ const createCdbMcpServer = () => {
       const commandToRun = initialCommand || `.echo Attached to process. Target args: ${debuggerArgs.join(' ')}`;
 
       try {
+        // ensureCdbProcessStopped is called before starting a new CDB instance for attach/dump
         const output = await executeCdbCommandViaStdio(commandToRun, debuggerPath, debuggerArgs);
         return { content: [{ type: "text", text: output }] };
       } catch (error: any) {
         logError(`Error in cdb-attach-to-process: ` + error.message);
-        return { content: [{ type: "text", text: `Error attaching to process: ${error.message}` }] };
+        const userMessage = formatCdbToolError(error, "attaching to process");
+        return { content: [{ type: "text", text: userMessage }] };
       }
     }
   );
@@ -395,11 +426,13 @@ const createCdbMcpServer = () => {
       const commandToRun = initialCommand || `.echo Loaded dump file: ${dumpFilePath}. Target args: ${debuggerArgs.join(' ')}`;
 
       try {
+        // ensureCdbProcessStopped is called before starting a new CDB instance for attach/dump
         const output = await executeCdbCommandViaStdio(commandToRun, debuggerPath, debuggerArgs);
         return { content: [{ type: "text", text: output }] };
       } catch (error: any) {
         logError(`Error in cdb-open-crash-dump: ` + error.message);
-        return { content: [{ type: "text", text: `Error opening dump file: ${error.message}` }] };
+        const userMessage = formatCdbToolError(error, "opening dump file");
+        return { content: [{ type: "text", text: userMessage }] };
       }
     }
   );
